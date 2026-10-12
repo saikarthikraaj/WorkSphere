@@ -1,10 +1,13 @@
 import React from "react";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, cleanup } from "@testing-library/react";
 import PowerGridReliabilityMonitor from "@/components/venue/PowerGridReliabilityMonitor";
 import {
   computeVenuePowerGridSummary,
   type DeskPowerNode,
   type PowerGridStatus,
+  getActivePowerGridListenersCount,
+  broadcastPowerGridTelemetry,
+  powerGridTelemetryStream,
 } from "@/lib/telemetry/powerGridEngine";
 
 // Mock usePushNotifications
@@ -23,6 +26,11 @@ jest.mock("@/hooks/usePushNotifications", () => ({
 }));
 
 describe("PowerGridReliabilityMonitor - Power Outage Push Notifications (#5307)", () => {
+  afterEach(() => {
+    cleanup();
+    powerGridTelemetryStream.reset();
+  });
+
   beforeEach(() => {
     jest.clearAllMocks();
     localStorage.clear();
@@ -173,6 +181,9 @@ describe("PowerGridReliabilityMonitor - Power Outage Push Notifications (#5307)"
       // Subscribe first
       const toggleBtn = screen.getByTestId("power-outage-subscription-toggle");
       fireEvent.click(toggleBtn);
+      await waitFor(() => {
+        expect(toggleBtn).toHaveTextContent("Outage Alerts Subscribed");
+      });
 
       // Simulate generator switch
       const genBtn = screen.getByTestId("simulate-generator-btn");
@@ -185,4 +196,68 @@ describe("PowerGridReliabilityMonitor - Power Outage Push Notifications (#5307)"
       });
     });
   });
+
+  describe("3. Telemetry Stream Subscription and Memory Leak Cleanup (#5273)", () => {
+    afterEach(() => {
+      powerGridTelemetryStream.reset();
+    });
+
+    it("registers telemetry listener on mount and deregisters on unmount", async () => {
+      const venueId = "venue-sf-01";
+      expect(getActivePowerGridListenersCount(venueId)).toBe(0);
+
+      const { unmount } = render(<PowerGridReliabilityMonitor venueId={venueId} />);
+
+      await waitFor(() => {
+        expect(getActivePowerGridListenersCount(venueId)).toBe(1);
+      });
+
+      unmount();
+
+      expect(getActivePowerGridListenersCount(venueId)).toBe(0);
+    });
+
+    it("receives real-time telemetry updates when mounted", async () => {
+      const venueId = "venue-sf-01";
+      render(<PowerGridReliabilityMonitor venueId={venueId} />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId("grid-status-badge")).toBeInTheDocument();
+      });
+
+      // Broadcast a real-time status update
+      act(() => {
+        broadcastPowerGridTelemetry(venueId, {
+          gridStatus: "OUTAGE",
+          batteryBackupMinutesRemaining: 30,
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId("grid-status-badge")).toHaveTextContent("Sudden Power Outage");
+      });
+    });
+
+    it("does not leak listeners or throw unhandled errors when broadcasting after unmount", async () => {
+      const venueId = "venue-sf-01";
+      const { unmount } = render(<PowerGridReliabilityMonitor venueId={venueId} />);
+
+      await waitFor(() => {
+        expect(getActivePowerGridListenersCount(venueId)).toBe(1);
+      });
+
+      unmount();
+      expect(getActivePowerGridListenersCount(venueId)).toBe(0);
+
+      // Broadcasting after unmount must be safe and have no active listeners
+      expect(() => {
+        broadcastPowerGridTelemetry(venueId, {
+          gridStatus: "GENERATOR_ACTIVE",
+        });
+      }).not.toThrow();
+
+      expect(getActivePowerGridListenersCount(venueId)).toBe(0);
+    });
+  });
 });
+

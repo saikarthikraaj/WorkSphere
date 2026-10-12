@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Zap,
   Plug,
@@ -11,21 +11,17 @@ import {
   Activity,
   ShieldCheck,
   RefreshCw,
-  Cpu,
-  Laptop,
-  Smartphone,
-  Tablet,
   Flag,
   Bell,
   BellRing,
-  BellOff,
   Radio,
 } from "lucide-react";
-import type {
-  VenuePowerGridSummary,
-  DeskPowerNode,
-  OutletHealthStatus,
-  PowerGridStatus,
+import {
+  type VenuePowerGridSummary,
+  type DeskPowerNode,
+  type OutletHealthStatus,
+  type PowerGridStatus,
+  subscribePowerGridTelemetry,
 } from "@/lib/telemetry/powerGridEngine";
 import { usePushNotifications } from "@/hooks/usePushNotifications";
 
@@ -36,7 +32,7 @@ interface PowerGridReliabilityMonitorProps {
 
 export default function PowerGridReliabilityMonitor({
   venueId = "venue-sf-01",
-  venueName = "Mission Focus Coworking & Cafe",
+  venueName: _venueName = "Mission Focus Coworking & Cafe",
 }: PowerGridReliabilityMonitorProps) {
   const [summary, setSummary] = useState<VenuePowerGridSummary | null>(null);
   const [loading, setLoading] = useState(true);
@@ -44,13 +40,39 @@ export default function PowerGridReliabilityMonitor({
   const [reportSuccessMsg, setReportSuccessMsg] = useState<string | null>(null);
   const [submittingReport, setSubmittingReport] = useState(false);
 
+  // Lifespan & memory leak prevention refs
+  const isMountedRef = useRef<boolean>(true);
+  const timersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+
+  const setSafeTimeout = useCallback((callback: () => void, delayMs: number) => {
+    const timer = setTimeout(() => {
+      timersRef.current = timersRef.current.filter((t) => t !== timer);
+      if (isMountedRef.current) {
+        callback();
+      }
+    }, delayMs);
+    if (typeof (timer as unknown as { unref?: () => void })?.unref === "function") {
+      (timer as unknown as { unref: () => void }).unref();
+    }
+    timersRef.current.push(timer);
+    return timer;
+  }, []);
+
+  // Clean up all active timeouts on unmount
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      timersRef.current.forEach((timer) => clearTimeout(timer));
+      timersRef.current = [];
+    };
+  }, []);
+
   // Power outage push notification subscription state
   const {
     isSupported: isPushSupported,
     isSubscribed: isPushSubscribed,
-    permission: pushPermission,
     subscribe: subscribePush,
-    unsubscribe: unsubscribePush,
     isLoading: isPushLoading,
   } = usePushNotifications();
 
@@ -72,27 +94,51 @@ export default function PowerGridReliabilityMonitor({
     }
   }, [venueId]);
 
-  const fetchPowerGrid = async (statusOverride?: PowerGridStatus) => {
-    setLoading(true);
-    try {
-      const url = statusOverride
-        ? `/api/telemetry/outlets?venueId=${venueId}&gridStatus=${statusOverride}`
-        : `/api/telemetry/outlets?venueId=${venueId}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      if (data.success) {
-        setSummary(data.summary);
+  const fetchPowerGrid = useCallback(
+    async (statusOverride?: PowerGridStatus, signal?: AbortSignal) => {
+      setLoading(true);
+      try {
+        const url = statusOverride
+          ? `/api/telemetry/outlets?venueId=${venueId}&gridStatus=${statusOverride}`
+          : `/api/telemetry/outlets?venueId=${venueId}`;
+        const res = await fetch(url, { signal });
+        const data = await res.json();
+        if (isMountedRef.current && data.success) {
+          setSummary(data.summary);
+        }
+      } catch (err: unknown) {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          return;
+        }
+        if (isMountedRef.current) {
+          console.error("Failed to load power grid telemetry:", err);
+        }
+      } finally {
+        if (isMountedRef.current) {
+          setLoading(false);
+        }
       }
-    } catch (err) {
-      console.error("Failed to load power grid telemetry:", err);
-    } finally {
-      setLoading(false);
-    }
-  };
+    },
+    [venueId]
+  );
 
+  // Real-time telemetry stream subscription & initial fetch lifecycle
   useEffect(() => {
-    fetchPowerGrid();
-  }, [venueId]);
+    const abortController = new AbortController();
+    fetchPowerGrid(undefined, abortController.signal);
+
+    // Attach real-time websocket/telemetry stream listener with cleanup
+    const unsubscribeTelemetry = subscribePowerGridTelemetry(venueId, (update) => {
+      if (isMountedRef.current) {
+        setSummary((prev) => (prev ? { ...prev, ...update } : (update as VenuePowerGridSummary)));
+      }
+    });
+
+    return () => {
+      abortController.abort();
+      unsubscribeTelemetry();
+    };
+  }, [venueId, fetchPowerGrid]);
 
   // Push notification trigger on status transition to OUTAGE or GENERATOR_ACTIVE
   useEffect(() => {
@@ -140,7 +186,7 @@ export default function PowerGridReliabilityMonitor({
     }
 
     setPrevGridStatus(currentStatus);
-  }, [summary?.gridStatus, powerAlertsSubscribed, prevGridStatus, summary?.venueName, summary?.batteryBackupMinutesRemaining, venueId]);
+  }, [summary, powerAlertsSubscribed, prevGridStatus, venueId]);
 
   const handleTogglePushAlerts = async () => {
     if (powerAlertsSubscribed) {
@@ -149,16 +195,12 @@ export default function PowerGridReliabilityMonitor({
         localStorage.setItem(`power_alerts_subscribed_${venueId}`, "false");
       }
       setReportSuccessMsg("Unsubscribed from power outage alerts for this venue.");
-      setTimeout(() => setReportSuccessMsg(null), 3000);
+      setSafeTimeout(() => setReportSuccessMsg(null), 3000);
     } else {
-      let granted = false;
       if (isPushSupported && !isPushSubscribed) {
-        granted = await subscribePush();
+        await subscribePush();
       } else if (typeof window !== "undefined" && "Notification" in window) {
-        const perm = await Notification.requestPermission();
-        granted = perm === "granted";
-      } else {
-        granted = true;
+        await Notification.requestPermission();
       }
 
       setPowerAlertsSubscribed(true);
@@ -166,7 +208,7 @@ export default function PowerGridReliabilityMonitor({
         localStorage.setItem(`power_alerts_subscribed_${venueId}`, "true");
       }
       setReportSuccessMsg("Subscribed to automated power outage & emergency generator push alerts!");
-      setTimeout(() => setReportSuccessMsg(null), 4000);
+      setSafeTimeout(() => setReportSuccessMsg(null), 4000);
     }
   };
 
@@ -196,15 +238,19 @@ export default function PowerGridReliabilityMonitor({
         }),
       });
       const data = await res.json();
-      if (data.success) {
+      if (isMountedRef.current && data.success) {
         setReportingNode(null);
         setReportSuccessMsg(`Issue logged for ${node.seatNumber}. Facility ops notified!`);
-        setTimeout(() => setReportSuccessMsg(null), 4000);
+        setSafeTimeout(() => setReportSuccessMsg(null), 4000);
       }
     } catch (err) {
-      console.error("Report error:", err);
+      if (isMountedRef.current) {
+        console.error("Report error:", err);
+      }
     } finally {
-      setSubmittingReport(false);
+      if (isMountedRef.current) {
+        setSubmittingReport(false);
+      }
     }
   };
 
